@@ -27,7 +27,7 @@ func ConvertChatRequest(body []byte, model string) ([]byte, error) {
 		return nil, errors.New("messages must be a non-empty array")
 	}
 
-	input, err := convertMessages(messages)
+	input, err := convertMessages(messages, "")
 	if err != nil {
 		return nil, err
 	}
@@ -76,6 +76,18 @@ func ConvertChatRequest(body []byte, model string) ([]byte, error) {
 			rawTools = append(rawTools, map[string]any{"type": "web_search"})
 		}
 	}
+	// Apply domain filters to web_search tools (from tool filters or top-level fields)
+	for i, t := range rawTools {
+		if m, ok := t.(map[string]any); ok {
+			if mt, _ := m["type"].(string); isWebSearchType(mt) {
+				converted, err := convertWebSearchTool(m)
+				if err != nil {
+					return nil, err
+				}
+				rawTools[i] = converted
+			}
+		}
+	}
 	// Flatten OpenAI nested function format to Responses flat format
 	var tools []any
 	for _, t := range rawTools {
@@ -102,7 +114,7 @@ func ConvertChatRequest(body []byte, model string) ([]byte, error) {
 	return json.Marshal(target)
 }
 
-func convertMessages(messages []chatMessage) ([]any, error) {
+func convertMessages(messages []chatMessage, scope string) ([]any, error) {
 	var out []any
 	for _, msg := range messages {
 		switch msg.Role {
@@ -127,24 +139,33 @@ func convertMessages(messages []chatMessage) ([]any, error) {
 			if content != "" {
 				item["content"] = content
 			}
+			if len(item) > 1 {
+				out = append(out, item)
+			}
 			if !isEmptyJSON(msg.ToolCalls) {
 				var calls []map[string]any
 				if json.Unmarshal(msg.ToolCalls, &calls) == nil {
 					for _, c := range calls {
 						fn, _ := c["function"].(map[string]any)
 						if fn != nil {
+							callID, _ := c["id"].(string)
+							if ri, ok := defaultReasoningCache.Get(callID); ok {
+								out = append(out, map[string]any{
+									"type": "reasoning",
+									"id": ri.ID,
+									"encrypted_content": ri.Encrypted,
+									"summary": []any{},
+								})
+							}
 							out = append(out, map[string]any{
 								"type": "function_call",
-								"call_id": c["id"],
+								"call_id": callID,
 								"name":  fn["name"],
 								"arguments": fn["arguments"],
 							})
 						}
 					}
 				}
-			}
-			if len(item) > 1 {
-				out = append(out, item)
 			}
 		case "tool":
 			content := extractText(msg.Content)
@@ -286,3 +307,102 @@ func flattenToolChoice(raw json.RawMessage) json.RawMessage {
 	}
 	return mustJSON(flat)
 }
+
+
+var webSearchTypes = map[string]bool{
+	"web_search": true, "web_search_preview": true,
+	"web_search_preview_2025_03_11": true, "web_search_2025_08_26": true,
+}
+
+const maxWebSearchDomains = 5
+
+func isWebSearchType(t string) bool { return webSearchTypes[t] }
+
+// convertWebSearchTool normalizes a web_search tool: accepts OpenAI nested
+// filters (filters.allowed_domains / filters.excluded_domains) or top-level
+// fields, enforces exclusivity and the 5-domain cap, emits flat upstream shape.
+func convertWebSearchTool(tool map[string]any) (map[string]any, error) {
+	nested := map[string][]any{}
+	if rawFilters, exists := tool["filters"]; exists {
+		filters, ok := rawFilters.(map[string]any)
+		if !ok {
+			return nil, errors.New("web_search filters must be an object")
+		}
+		for _, field := range []string{"allowed_domains", "excluded_domains"} {
+			if v, exists := filters[field]; exists {
+				domains, err := normalizeWebSearchDomains(v, field)
+				if err != nil {
+					return nil, err
+				}
+				nested[field] = domains
+			}
+		}
+	}
+
+	resultFilters := map[string]any{}
+	for _, field := range []string{"allowed_domains", "excluded_domains"} {
+		var topLevel []any
+		if v, exists := tool[field]; exists {
+			domains, err := normalizeWebSearchDomains(v, field)
+			if err != nil {
+				return nil, err
+			}
+			topLevel = domains
+		}
+		domains := nested[field]
+		if len(domains) > 0 && len(topLevel) > 0 && !sameDomains(domains, topLevel) {
+			return nil, fmt.Errorf("web_search %s conflict between filters and top-level", field)
+		}
+		if len(domains) == 0 {
+			domains = topLevel
+		}
+		if len(domains) > 0 {
+			resultFilters[field] = domains
+		}
+	}
+	if _, hasAllowed := resultFilters["allowed_domains"]; hasAllowed {
+		if _, hasExcluded := resultFilters["excluded_domains"]; hasExcluded {
+			return nil, errors.New("web_search cannot set both allowed_domains and excluded_domains")
+		}
+	}
+	converted := map[string]any{"type": "web_search"}
+	if len(resultFilters) > 0 {
+		converted["filters"] = resultFilters
+	}
+	return converted, nil
+}
+
+func normalizeWebSearchDomains(value any, field string) ([]any, error) {
+	if value == nil {
+		return nil, nil
+	}
+	domains, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("web_search %s must be a string array", field)
+	}
+	if len(domains) > maxWebSearchDomains {
+		return nil, fmt.Errorf("web_search %s exceeds %d domains", field, maxWebSearchDomains)
+	}
+	for i, v := range domains {
+		d, ok := v.(string)
+		if !ok || strings.TrimSpace(d) == "" {
+			return nil, fmt.Errorf("web_search %s[%d] must be a non-empty string", field, i)
+		}
+	}
+	return domains, nil
+}
+
+func sameDomains(left, right []any) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// ConvertChatRequestForTest wraps ConvertChatRequest for verification tests.
+func ConvertChatRequestForTest(body []byte, model string) ([]byte, error) { return ConvertChatRequest(body, model) }

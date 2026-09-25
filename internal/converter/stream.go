@@ -217,6 +217,15 @@ func (c *StreamConverter) handleEvent(event map[string]any, status *string, usag
 				if u, ok := resp["usage"].(map[string]any); ok {
 					*usage = convertUsage(u)
 				}
+				if out, ok := resp["output"].([]any); ok {
+					var items []map[string]any
+					for _, raw := range out {
+						if m, ok := raw.(map[string]any); ok {
+							items = append(items, m)
+						}
+					}
+					CaptureReasoningFromOutput(items)
+				}
 			}
 			c.done(*status, *usage)
 		case "error":

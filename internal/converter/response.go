@@ -20,6 +20,7 @@ func ConvertResponsesToChat(body []byte, model string) ([]byte, error) {
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, err
 	}
+	CaptureReasoningFromOutput(resp.Output)
 
 	var content strings.Builder
 	var toolCalls []map[string]any
