@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>grok2api-small</title>
+<style>
+:root{--bg:#0f0f0f;--card:#1a1a1a;--border:#333;--text:#e0e0e0;--accent:#4a9eff;--green:#4ade80;--red:#f87171}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:system-ui,sans-serif;padding:20px}
+h1{font-size:1.4rem;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:16px}
+.tabs{display:flex;gap:4px;margin-bottom:16px}
+.tab{padding:8px 16px;background:var(--card);border:1px solid var(--border);border-radius:6px 6px 0 0;cursor:pointer;font-size:.9rem}
+.tab.active{background:var(--accent);border-color:var(--accent);color:#fff}
+table{width:100%;border-collapse:collapse;font-size:.85rem}
+th,td{padding:6px 8px;text-align:left;border-bottom:1px solid var(--border)}
+th{color:#888;font-weight:600}
+.badge{padding:2px 8px;border-radius:4px;font-size:.75rem}
+.badge.active{background:var(--green);color:#000}
+.badge.inactive{background:var(--red);color:#000}
+button{padding:6px 14px;border:1px solid var(--border);background:var(--card);color:var(--text);border-radius:6px;cursor:pointer;font-size:.85rem}
+button:hover{border-color:var(--accent)}
+input,textarea,select{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:6px;font-size:.85rem}
+input{width:200px}textarea{width:100%;min-height:60px}
+.row{display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap}
+.stat{display:inline-block;padding:4px 12px;background:var(--card);border-radius:6px;font-size:.8rem}
+.stat b{color:var(--accent)}
+#toast{position:fixed;bottom:20px;right:20px;padding:10px 20px;border-radius:8px;background:var(--accent);color:#fff;display:none}
+</style>
+</head>
+<body>
+<h1>⚡ grok2api-small</h1>
+<div class="tabs">
+<div class="tab active" onclick="showTab('accounts')">Accounts</div>
+<div class="tab" onclick="showTab('models')">Models</div>
+<div class="tab" onclick="showTab('keys')">Client Keys</div>
+<div class="tab" onclick="showTab('sync')">Sync</div>
+</div>
+
+<div id="accounts" class="tab-panel">
+<div class="card">
+<div class="row">
+<button onclick="loadAccounts()">Refresh</button>
+<span class="stat" id="acct-count">- accounts</span>
+</div>
+<table>
+<thead><tr><th>ID</th><th>Name</th><th>Email</th><th>Status</th><th>Actions</th></tr></thead>
+<tbody id="acct-body"></tbody>
+</table>
+</div>
+<div class="card">
+<h3>Add Account (Import Refresh Token)</h3>
+<div class="row"><input id="rt-name" placeholder="Name (optional)"></div>
+<div class="row"><input id="rt-token" placeholder="Refresh token" style="width:400px"></div>
+<div class="row"><button onclick="importToken()">Import</button></div>
+</div>
+</div>
+
+<div id="models" class="tab-panel" style="display:none">
+<div class="card">
+<div class="row"><button onclick="loadModels()">Refresh</button></div>
+<table>
+<thead><tr><th>Public ID</th><th>Upstream Model</th><th>Provider</th><th>Origin</th></tr></thead>
+<tbody id="model-body"></tbody>
+</table>
+</div>
+<div class="card">
+<h3>Retained Models</h3>
+<p style="font-size:.8rem;color:#888;margin-bottom:8px">Edit data/retained_models.json and restart, or use API.</p>
+</div>
+</div>
+
+<div id="keys" class="tab-panel" style="display:none">
+<div class="card">
+<div class="row"><button onclick="loadKeys()">Refresh</button></div>
+<table>
+<thead><tr><th>ID</th><th>Name</th><th>Actions</th></tr></thead>
+<tbody id="key-body"></tbody>
+</table>
+</div>
+<div class="card">
+<h3>Generate Client Key</h3>
+<div class="row"><input id="key-name" placeholder="Key name" value="default"></div>
+<div class="row"><button onclick="genKey()">Generate</button></div>
+<div id="key-output" style="font-size:.8rem;color:var(--green);margin-top:8px"></div>
+</div>
+</div>
+
+<div id="sync" class="tab-panel" style="display:none">
+<div class="card">
+<h3>Model Capability Sync</h3>
+<div class="row"><button onclick="triggerSync()">Sync All Accounts</button></div>
+<div id="sync-output" style="margin-top:8px;font-size:.85rem"></div>
+</div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const API='/api/admin';
+let adminToken='';
+
+function showTab(id){
+document.querySelectorAll('.tab-panel').forEach(p=>p.style.display='none');
+document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+document.getElementById(id).style.display='block';
+event.target.classList.add('active');
+}
+
+function toast(msg){
+const t=document.getElementById('toast');t.textContent=msg;t.style.display='block';
+setTimeout(()=>t.style.display='none',3000);
+}
+
+async function loadAccounts(){
+const r=await fetch(API+'/accounts');const d=await r.json();
+document.getElementById('acct-count').textContent=d.length+' accounts';
+const tb=document.getElementById('acct-body');
+tb.innerHTML=d.map(a=>`<tr>
+<td>${a.id}</td><td>${a.name||'-'}</td><td>${a.email||'-'}</td>
+<td><span class="badge ${a.enabled&&a.auth_status==='active'?'active':'inactive'}">${a.auth_status}</span></td>
+<td><button onclick="toggleAcct(${a.id},${a.enabled?0:1})">${a.enabled?'Disable':'Enable'}</button>
+<button onclick="delAcct(${a.id})" style="border-color:var(--red)">Delete</button></td>
+</tr>`).join('');
+}
+
+async function importToken(){
+const rt=document.getElementById('rt-token').value.trim();if(!rt){toast('Enter refresh token');return;}
+const name=document.getElementById('rt-name').value.trim();
+const r=await fetch(API+'/accounts/import',{method:'POST',headers:{'Content-Type':'application/json'},
+body:JSON.stringify({refresh_token:rt,name:name})});
+if(r.ok){toast('Account imported');loadAccounts();}
+else{const e=await r.text();toast('Import failed: '+e);}
+}
+
+async function toggleAcct(id,en){
+await fetch(API+`/accounts/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:en})});
+toast('Updated');loadAccounts();
+}
+
+async function delAcct(id){
+if(!confirm('Delete account '+id+'?'))return;
+await fetch(API+`/accounts/${id}`,{method:'DELETE'});
+toast('Deleted');loadAccounts();
+}
+
+async function loadModels(){
+const r=await fetch(API+'/models');const d=await r.json();
+const tb=document.getElementById('model-body');
+tb.innerHTML=d.map(m=>`<tr><td>${m.public_id}</td><td>${m.upstream_model}</td><td>${m.provider}</td><td>${m.origin}</td></tr>`).join('');
+}
+
+async function loadKeys(){
+const r=await fetch(API+'/keys');const d=await r.json();
+const tb=document.getElementById('key-body');
+tb.innerHTML=d.map(k=>`<tr><td>${k.id}</td><td>${k.name}</td><td><button onclick="delKey(${k.id})" style="border-color:var(--red)">Delete</button></td></tr>`).join('');
+}
+
+async function genKey(){
+const name=document.getElementById('key-name').value.trim()||'default';
+const r=await fetch(API+'/keys/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name})});
+const d=await r.json();
+document.getElementById('key-output').textContent='API Key: '+d.key;
+toast('Key generated');loadKeys();
+}
+
+async function delKey(id){
+await fetch(API+`/keys/${id}`,{method:'DELETE'});
+toast('Deleted');loadKeys();
+}
+
+async function triggerSync(){
+document.getElementById('sync-output').textContent='Syncing...';
+const r=await fetch(API+'/sync',{method:'POST'});
+const d=await r.json();
+document.getElementById('sync-output').textContent=`Done: ${d.succeeded} succeeded, ${d.failed} failed`;
+}
+
+loadAccounts();
+</script>
+</body>
+</html>
