@@ -58,22 +58,29 @@ func ConvertChatRequest(body []byte, model string) ([]byte, error) {
 		target["text"] = mustJSON(map[string]json.RawMessage{"format": raw})
 	}
 
-	var tools []any
+	var rawTools []any
 	if raw := source["tools"]; !isEmptyJSON(raw) {
-		if err := json.Unmarshal(raw, &tools); err != nil {
+		if err := json.Unmarshal(raw, &rawTools); err != nil {
 			return nil, fmt.Errorf("parse tools: %w", err)
-	}
+		}
 	}
 	if !isEmptyJSON(source["web_search_options"]) {
 		hasWebSearch := false
-		for _, t := range tools {
+		for _, t := range rawTools {
 			if m, ok := t.(map[string]any); ok && m["type"] == "web_search" {
 				hasWebSearch = true
 				break
 			}
 		}
 		if !hasWebSearch {
-			tools = append(tools, map[string]any{"type": "web_search"})
+			rawTools = append(rawTools, map[string]any{"type": "web_search"})
+		}
+	}
+	// Flatten OpenAI nested function format to Responses flat format
+	var tools []any
+	for _, t := range rawTools {
+		if flat := flattenTool(t); flat != nil {
+			tools = append(tools, flat)
 		}
 	}
 	if len(tools) > 0 {
@@ -81,7 +88,7 @@ func ConvertChatRequest(body []byte, model string) ([]byte, error) {
 	}
 
 	if raw := source["tool_choice"]; !isEmptyJSON(raw) {
-		target["tool_choice"] = raw
+		target["tool_choice"] = flattenToolChoice(raw)
 	}
 
 	if raw := source["stop"]; !isEmptyJSON(raw) {
@@ -232,4 +239,50 @@ func copyFields(target, source map[string]json.RawMessage, fields ...string) {
 			target[f] = v
 		}
 	}
+}
+
+// flattenTool converts OpenAI nested tool format {type, function:{name,description,parameters}}
+// to Responses flat format {type, name, description, parameters}. Non-function tools pass through.
+func flattenTool(t any) any {
+	m, ok := t.(map[string]any)
+	if !ok {
+		return t
+	}
+	fn, ok := m["function"].(map[string]any)
+	if !ok {
+		return t // already flat or non-function type (web_search etc)
+	}
+	flat := map[string]any{"type": "function"}
+	if name, ok := fn["name"].(string); ok {
+		flat["name"] = name
+	}
+	if desc, ok := fn["description"].(string); ok {
+		flat["description"] = desc
+	}
+	if params, ok := fn["parameters"]; ok {
+		flat["parameters"] = params
+	}
+	return flat
+}
+
+// flattenToolChoice converts OpenAI {type:function, function:{name}} to Responses {type:function, name}.
+// String choices ("auto", "none", "required") pass through unchanged.
+func flattenToolChoice(raw json.RawMessage) json.RawMessage {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return raw
+	}
+	var m map[string]any
+	if json.Unmarshal(raw, &m) != nil {
+		return raw
+	}
+	fn, ok := m["function"].(map[string]any)
+	if !ok {
+		return raw
+	}
+	flat := map[string]any{"type": "function"}
+	if name, ok := fn["name"].(string); ok {
+		flat["name"] = name
+	}
+	return mustJSON(flat)
 }
