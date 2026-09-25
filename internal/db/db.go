@@ -83,6 +83,32 @@ CREATE INDEX IF NOT EXISTS idx_routes_public ON model_routes(public_id);
 CREATE INDEX IF NOT EXISTS idx_routes_provider ON model_routes(provider);
 CREATE INDEX IF NOT EXISTS idx_caps_model ON account_model_capabilities(upstream_model);
 
+CREATE TABLE IF NOT EXISTS account_quota_windows (
+	account_id INTEGER NOT NULL,
+	mode TEXT NOT NULL DEFAULT 'build',
+	remaining INTEGER NOT NULL DEFAULT 0,
+	total INTEGER NOT NULL DEFAULT 0,
+	usage_percent REAL NOT NULL DEFAULT 0,
+	window_seconds INTEGER NOT NULL DEFAULT 0,
+	reset_at INTEGER,
+	synced_at INTEGER,
+	source TEXT NOT NULL DEFAULT 'default',
+	updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+	PRIMARY KEY (account_id, mode)
+);
+
+CREATE TABLE IF NOT EXISTS quota_recovery_queue (
+	account_id INTEGER NOT NULL,
+	mode TEXT NOT NULL DEFAULT 'build',
+	due_at INTEGER NOT NULL,
+	attempts INTEGER NOT NULL DEFAULT 0,
+	claim_token TEXT,
+	PRIMARY KEY (account_id, mode)
+);
+
+CREATE INDEX IF NOT EXISTS idx_quota_due ON quota_recovery_queue(due_at);
+
+
 `)
 	if err != nil {
 		return err
@@ -459,4 +485,158 @@ func (db *DB) CountActiveAccountsForModel(upstreamModel string) (int, error) {
 		AND a.cooldown_until <= ?
 		AND EXISTS (SELECT 1 FROM account_model_capabilities c WHERE c.account_id=a.id AND c.upstream_model=?)`, now, upstreamModel).Scan(&count)
 	return count, err
+}
+
+
+// --- Quota window operations ---
+
+type QuotaWindow struct {
+	AccountID     int64
+	Mode          string
+	Remaining     int
+	Total         int
+	UsagePercent  float64
+	WindowSeconds int64
+	ResetAt       int64
+	SyncedAt      int64
+	Source        string
+	UpdatedAt     int64
+}
+
+func (db *DB) UpsertQuotaWindow(w QuotaWindow) error {
+	_, err := db.Exec(`INSERT INTO account_quota_windows
+		(account_id, mode, remaining, total, usage_percent, window_seconds, reset_at, synced_at, source, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,unixepoch())
+		ON CONFLICT(account_id, mode) DO UPDATE SET
+			remaining=excluded.remaining, total=excluded.total, usage_percent=excluded.usage_percent,
+			window_seconds=excluded.window_seconds, reset_at=excluded.reset_at,
+			synced_at=excluded.synced_at, source=excluded.source, updated_at=unixepoch()`,
+		w.AccountID, w.Mode, w.Remaining, w.Total, w.UsagePercent, w.WindowSeconds, nilIfZero(w.ResetAt), nilIfZero(w.SyncedAt), w.Source)
+	return err
+}
+
+func (db *DB) GetQuotaWindow(accountID int64, mode string) (*QuotaWindow, error) {
+	var w QuotaWindow
+	var resetAt, syncedAt sql.NullInt64
+	err := db.QueryRow(`SELECT account_id, mode, remaining, total, usage_percent, window_seconds, reset_at, synced_at, source, updated_at
+		FROM account_quota_windows WHERE account_id=? AND mode=?`, accountID, mode).
+		Scan(&w.AccountID, &w.Mode, &w.Remaining, &w.Total, &w.UsagePercent, &w.WindowSeconds, &resetAt, &syncedAt, &w.Source, &w.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	w.ResetAt = resetAt.Int64
+	w.SyncedAt = syncedAt.Int64
+	return &w, nil
+}
+
+func (db *DB) ListDueQuotaWindows(now int64, limit int) ([]QuotaWindow, error) {
+	rows, err := db.Query(`SELECT account_id, mode, remaining, total, usage_percent, window_seconds, reset_at, synced_at, source, updated_at
+		FROM account_quota_windows
+		WHERE remaining <= 0 AND (reset_at IS NULL OR reset_at <= ?)
+		ORDER BY reset_at ASC LIMIT ?`, now, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []QuotaWindow
+	for rows.Next() {
+		var w QuotaWindow
+		var resetAt, syncedAt sql.NullInt64
+		if err := rows.Scan(&w.AccountID, &w.Mode, &w.Remaining, &w.Total, &w.UsagePercent, &w.WindowSeconds, &resetAt, &syncedAt, &w.Source, &w.UpdatedAt); err != nil {
+			return nil, err
+		}
+		w.ResetAt = resetAt.Int64
+		w.SyncedAt = syncedAt.Int64
+		out = append(out, w)
+	}
+	return out, nil
+}
+
+// --- Quota recovery queue ---
+
+type RecoveryEvent struct {
+	AccountID   int64
+	Mode        string
+	DueAt       int64
+	Attempts    int
+	ClaimToken  string
+}
+
+func (db *DB) EnsureQuotaRecovery(ev RecoveryEvent) error {
+	_, err := db.Exec(`INSERT INTO quota_recovery_queue (account_id, mode, due_at, attempts, claim_token)
+		VALUES (?,?,?,?,?)
+		ON CONFLICT(account_id, mode) DO UPDATE SET due_at=excluded.due_at, attempts=excluded.attempts`,
+		ev.AccountID, ev.Mode, ev.DueAt, ev.Attempts, ev.ClaimToken)
+	return err
+}
+
+func (db *DB) ClaimDueRecoveries(now int64, limit int) ([]RecoveryEvent, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`SELECT account_id, mode, due_at, attempts, claim_token
+		FROM quota_recovery_queue WHERE due_at <= ? ORDER BY due_at ASC LIMIT ?`, now, limit)
+	if err != nil {
+		return nil, err
+	}
+	var events []RecoveryEvent
+	for rows.Next() {
+		var ev RecoveryEvent
+		var claim sql.NullString
+		if err := rows.Scan(&ev.AccountID, &ev.Mode, &ev.DueAt, &ev.Attempts, &claim); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ev.ClaimToken = claim.String
+		events = append(events, ev)
+	}
+	rows.Close()
+
+	for _, ev := range events {
+		tx.Exec(`UPDATE quota_recovery_queue SET due_at=? WHERE account_id=? AND mode=?`,
+			now+120, ev.AccountID, ev.Mode)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+func (db *DB) AckQuotaRecovery(ev RecoveryEvent) error {
+	_, err := db.Exec(`DELETE FROM quota_recovery_queue WHERE account_id=? AND mode=?`, ev.AccountID, ev.Mode)
+	return err
+}
+
+func (db *DB) RescheduleQuotaRecovery(ev RecoveryEvent) error {
+	_, err := db.Exec(`UPDATE quota_recovery_queue SET due_at=?, attempts=? WHERE account_id=? AND mode=?`,
+		ev.DueAt, ev.Attempts, ev.AccountID, ev.Mode)
+	return err
+}
+
+// --- Account quota status helpers ---
+
+func (db *DB) IsAccountQuotaExhausted(accountID int64) bool {
+	var count int
+	db.QueryRow(`SELECT COUNT(*) FROM account_quota_windows WHERE account_id=? AND remaining <= 0`, accountID).Scan(&count)
+	return count > 0
+}
+
+func (db *DB) ClearAccountCooldownIfQuotaRecovered(accountID int64) error {
+	var exhausted int
+	db.QueryRow(`SELECT COUNT(*) FROM account_quota_windows WHERE account_id=? AND remaining <= 0`, accountID).Scan(&exhausted)
+	if exhausted == 0 {
+		_, err := db.Exec(`UPDATE accounts SET cooldown_until=0, failure_count=0, updated_at=unixepoch() WHERE id=?`, accountID)
+		return err
+	}
+	return nil
+}
+
+func nilIfZero(v int64) any {
+	if v == 0 {
+		return nil
+	}
+	return v
 }

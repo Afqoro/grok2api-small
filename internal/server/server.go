@@ -7,10 +7,12 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"grok2api-small/internal/converter"
 	"grok2api-small/internal/crypto"
 	"grok2api-small/internal/db"
+	"grok2api-small/internal/recovery"
 	"grok2api-small/internal/sync"
 	"grok2api-small/internal/upstream"
 )
@@ -20,11 +22,12 @@ type Server struct {
 	client  *upstream.Client
 	cipher  *crypto.Cipher
 	syncSvc *sync.SyncService
+	recSvc  *recovery.Service
 	logger  *slog.Logger
 }
 
-func New(database *db.DB, client *upstream.Client, cipher *crypto.Cipher, syncSvc *sync.SyncService) *Server {
-	return &Server{db: database, client: client, cipher: cipher, syncSvc: syncSvc, logger: slog.Default()}
+func New(database *db.DB, client *upstream.Client, cipher *crypto.Cipher, syncSvc *sync.SyncService, recSvc *recovery.Service) *Server {
+	return &Server{db: database, client: client, cipher: cipher, syncSvc: syncSvc, recSvc: recSvc, logger: slog.Default()}
 }
 
 func (s *Server) Routes() *http.ServeMux {
@@ -166,12 +169,42 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if result.StatusCode == 429 || result.StatusCode == 503 {
+			// Read body for rate limit parsing
+			bodyBytes, _ := io.ReadAll(io.LimitReader(result.Body, 64<<10))
 			result.Body.Close()
-			cooldown := int64(300)
+
+			cooldown := int64(300) // default 5 min for 503
 			if result.StatusCode == 429 {
-				cooldown = 3600 // 1 hour for quota exhaustion
+				cooldown = 3600 // default 1h
+				if rl := upstream.RateLimitFromResponse(429, result.Header, bodyBytes); rl != nil {
+					cooldown = int64(rl.RetryAfter.Seconds())
+					if cooldown < 2 {
+						cooldown = 2
+					}
+					s.logger.Info("rate_limit_parsed", "account_id", acct.ID, "scope", rl.Scope, "retry_after", rl.RetryAfter, "actual", rl.Actual, "limit", rl.Limit)
+				}
 			}
+
+			now := time.Now().Unix()
 			s.db.MarkAccountFailed(acct.ID, cooldown)
+
+			// Record quota window
+			s.db.UpsertQuotaWindow(db.QuotaWindow{
+				AccountID: acct.ID,
+				Mode: "build",
+				Remaining: 0,
+				ResetAt: now + cooldown,
+				SyncedAt: now,
+				Source: "upstream",
+			})
+
+			// Schedule recovery probe
+			s.db.EnsureQuotaRecovery(db.RecoveryEvent{
+				AccountID: acct.ID,
+				Mode: "build",
+				DueAt: now + cooldown,
+			})
+
 			lastCode = result.StatusCode
 			lastErr = fmt.Errorf("upstream %d for account %d", result.StatusCode, acct.ID)
 			continue
