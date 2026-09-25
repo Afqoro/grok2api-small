@@ -220,7 +220,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 		// success
 		s.db.MarkAccountSuccess(acct.ID)
-		s.handleChatResponse(w, result, req.Model, req.Stream)
+		s.handleChatResponse(w, result, acct.ID, req.Model, req.Stream)
 		return
 	}
 
@@ -236,7 +236,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 }
 
-func (s *Server) handleChatResponse(w http.ResponseWriter, result *upstream.ChatResult, model string, stream bool) {
+func (s *Server) handleChatResponse(w http.ResponseWriter, result *upstream.ChatResult, accountID int64, model string, stream bool) {
 	defer result.Body.Close()
 	if stream {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -245,6 +245,9 @@ func (s *Server) handleChatResponse(w http.ResponseWriter, result *upstream.Chat
 		w.WriteHeader(200)
 		sc := converter.NewStreamConverter(w, model)
 		sc.ProcessStream(result.Body)
+		if usage := sc.LastUsage(); usage != nil {
+			s.recordUsage(accountID, usage)
+		}
 	} else {
 		respBody, err := io.ReadAll(io.LimitReader(result.Body, 8<<20))
 		if err != nil {
@@ -256,9 +259,26 @@ func (s *Server) handleChatResponse(w http.ResponseWriter, result *upstream.Chat
 			writeError(w, 500, "conversion_error", err.Error())
 			return
 		}
+		var chatResp struct {
+			Usage *struct {
+				PromptTokens     int64 `json:"prompt_tokens"`
+				CompletionTokens int64 `json:"completion_tokens"`
+			} `json:"usage"`
+		}
+		if json.Unmarshal(converted, &chatResp) == nil && chatResp.Usage != nil {
+			s.db.AddAccountUsage(accountID, chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
 		w.Write(converted)
+	}
+}
+
+func (s *Server) recordUsage(accountID int64, usage map[string]any) {
+	prompt, _ := usage["prompt_tokens"].(float64)
+	completion, _ := usage["completion_tokens"].(float64)
+	if prompt > 0 || completion > 0 {
+		s.db.AddAccountUsage(accountID, int64(prompt), int64(completion))
 	}
 }
 

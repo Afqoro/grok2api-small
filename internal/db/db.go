@@ -108,6 +108,15 @@ CREATE TABLE IF NOT EXISTS quota_recovery_queue (
 
 CREATE INDEX IF NOT EXISTS idx_quota_due ON quota_recovery_queue(due_at);
 
+CREATE TABLE IF NOT EXISTS account_usage (
+	account_id INTEGER NOT NULL,
+	date TEXT NOT NULL DEFAULT (date('now')),
+	prompt_tokens INTEGER NOT NULL DEFAULT 0,
+	completion_tokens INTEGER NOT NULL DEFAULT 0,
+	requests INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (account_id, date)
+);
+
 
 `)
 	if err != nil {
@@ -639,4 +648,42 @@ func nilIfZero(v int64) any {
 		return nil
 	}
 	return v
+}
+
+// --- Account usage tracking ---
+
+func (db *DB) AddAccountUsage(accountID int64, promptTokens, completionTokens int64) error {
+	_, err := db.Exec(`INSERT INTO account_usage (account_id, prompt_tokens, completion_tokens, requests)
+		VALUES (?,?,?,1)
+		ON CONFLICT(account_id, date) DO UPDATE SET
+			prompt_tokens = prompt_tokens + excluded.prompt_tokens,
+			completion_tokens = completion_tokens + excluded.completion_tokens,
+			requests = requests + 1`, accountID, promptTokens, completionTokens)
+	return err
+}
+
+type UsageRow struct {
+	AccountID        int64
+	Date             string
+	PromptTokens     int64
+	CompletionTokens int64
+	Requests         int64
+}
+
+func (db *DB) ListUsageToday() ([]UsageRow, error) {
+	rows, err := db.Query(`SELECT account_id, date, prompt_tokens, completion_tokens, requests
+		FROM account_usage WHERE date = date('now') ORDER BY prompt_tokens + completion_tokens DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UsageRow
+	for rows.Next() {
+		var r UsageRow
+		if err := rows.Scan(&r.AccountID, &r.Date, &r.PromptTokens, &r.CompletionTokens, &r.Requests); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, nil
 }

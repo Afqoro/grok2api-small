@@ -25,6 +25,7 @@ func (s *Server) AdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/admin/keys/generate", s.handleAdminKeyGen)
 	mux.HandleFunc("/api/admin/sync", s.handleAdminSync)
 	mux.HandleFunc("/api/admin/reauth", s.handleAdminReauthList)
+	mux.HandleFunc("/api/admin/usage", s.handleAdminUsage)
 }
 
 func (s *Server) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
@@ -280,4 +281,20 @@ func (s *Server) handleAdminReauthList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeError(w, 405, "method_not_allowed", "GET or POST")
+}
+
+func (s *Server) handleAdminUsage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		writeError(w, 405, "method_not_allowed", "GET only")
+		return
+	}
+	rows, err := s.db.ListUsageToday()
+	if err != nil {
+		writeError(w, 500, "db_error", err.Error())
+		return
+	}
+	if rows == nil {
+		rows = []db.UsageRow{}
+	}
+	writeJSON(w, 200, rows)
 }

@@ -21,6 +21,7 @@ type StreamConverter struct {
 
 	tools map[string]streamTool
 	stopSequence string
+	lastUsage map[string]any
 }
 
 type streamTool struct {
@@ -123,6 +124,7 @@ func (c *StreamConverter) toolDelta(id, delta string) error {
 }
 
 func (c *StreamConverter) done(status string, usage map[string]any) error {
+	c.lastUsage = usage
 	finishReason := "stop"
 	if len(c.tools) > 0 {
 		finishReason = "tool_calls"
@@ -278,3 +280,6 @@ func randHex(n int) string {
 	}
 	return string(b)
 }
+
+// LastUsage returns the token usage captured from the most recent stream.
+func (c *StreamConverter) LastUsage() map[string]any { return c.lastUsage }

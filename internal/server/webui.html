@@ -97,9 +97,21 @@ input{width:200px}textarea{width:100%;min-height:60px}
 
 <div id="toast"></div>
 
+
+      <div id="tab-usage" class="tab-content" style="display:none">
+        <h3>Token Usage (Today)</h3>
+        <table id="usage-table"><thead><tr><th>Account</th><th>Prompt</th><th>Completion</th><th>Requests</th></tr></thead><tbody></tbody></table>
+      </div>
 <script>
 const API='/api/admin';
 let adminToken='';
+
+async function loadUsage() {
+  const r = await fetch('/api/admin/usage');
+  const d = await r.json();
+  const tb = document.querySelector('#usage-table tbody');
+  tb.innerHTML = (d||[]).map(u => `<tr><td>${u.AccountID}</td><td>${u.PromptTokens}</td><td>${u.CompletionTokens}</td><td>${u.Requests}</td></tr>`).join('') || '<tr><td colspan=4>no usage yet</td></tr>';
+}
 
 function showTab(id){
 document.querySelectorAll('.tab-panel').forEach(p=>p.style.display='none');
