@@ -6,3 +6,4 @@ env.sh
 ecosystem.config.js
 grok2api-small
 *.exe
+data/admin_token.txt

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"os"
 	"context"
 	"strings"
 
@@ -16,16 +18,17 @@ import (
 var cryptoRand = rand.Reader
 
 func (s *Server) AdminRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/api/admin/accounts", s.handleAdminAccounts)
-	mux.HandleFunc("/api/admin/accounts/", s.handleAdminAccountItem)
-	mux.HandleFunc("/api/admin/accounts/import", s.handleAdminImport)
-	mux.HandleFunc("/api/admin/models", s.handleAdminModels)
-	mux.HandleFunc("/api/admin/keys", s.handleAdminKeys)
-	mux.HandleFunc("/api/admin/keys/", s.handleAdminKeyItem)
-	mux.HandleFunc("/api/admin/keys/generate", s.handleAdminKeyGen)
-	mux.HandleFunc("/api/admin/sync", s.handleAdminSync)
-	mux.HandleFunc("/api/admin/reauth", s.handleAdminReauthList)
-	mux.HandleFunc("/api/admin/usage", s.handleAdminUsage)
+	auth := func(h http.HandlerFunc) http.HandlerFunc { return s.adminAuthMiddleware(h) }
+	mux.HandleFunc("/api/admin/accounts", auth(s.handleAdminAccounts))
+	mux.HandleFunc("/api/admin/accounts/", auth(s.handleAdminAccountItem))
+	mux.HandleFunc("/api/admin/accounts/import", auth(s.handleAdminImport))
+	mux.HandleFunc("/api/admin/models", auth(s.handleAdminModels))
+	mux.HandleFunc("/api/admin/keys", auth(s.handleAdminKeys))
+	mux.HandleFunc("/api/admin/keys/", auth(s.handleAdminKeyItem))
+	mux.HandleFunc("/api/admin/keys/generate", auth(s.handleAdminKeyGen))
+	mux.HandleFunc("/api/admin/sync", auth(s.handleAdminSync))
+	mux.HandleFunc("/api/admin/reauth", auth(s.handleAdminReauthList))
+	mux.HandleFunc("/api/admin/usage", auth(s.handleAdminUsage))
 }
 
 func (s *Server) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
@@ -297,4 +300,48 @@ func (s *Server) handleAdminUsage(w http.ResponseWriter, r *http.Request) {
 		rows = []db.UsageRow{}
 	}
 	writeJSON(w, 200, rows)
+}
+
+// adminAuthMiddleware requires a bearer token for requests arriving through
+// the public tunnel (identified by CF-Connecting-IP / X-Forwarded-For headers
+// set by cloudflared). Direct local/Tailscale access is not restricted.
+func (s *Server) adminAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("CF-Connecting-IP") != "" || r.Header.Get("X-Forwarded-For") != "" {
+			// spoof risk: these headers could be set by the client itself when
+			// hitting the local port directly; only trust them when the request
+			// came from a loopback source (cloudflared connects from 127.0.0.1)
+			isLoopback := false
+			host, _, err := net.SplitHostPort(r.RemoteAddr)
+			if err == nil && (host == "127.0.0.1" || host == "::1") {
+				isLoopback = true
+			}
+			if !isLoopback {
+				// direct remote client claiming CF headers = spoof attempt; require token
+				token, _ := os.ReadFile("data/admin_token.txt")
+				expected := strings.TrimSpace(string(token))
+				auth := r.Header.Get("Authorization")
+				if expected != "" && (auth == "Bearer "+expected || r.URL.Query().Get("token") == expected) {
+					next(w, r)
+					return
+				}
+				writeError(w, 401, "admin_auth_required", "admin token required")
+				return
+			}
+			token, _ := os.ReadFile("data/admin_token.txt")
+			expected := strings.TrimSpace(string(token))
+			if expected == "" {
+				writeError(w, 503, "admin_auth_unconfigured", "admin token not configured")
+				return
+			}
+			auth := r.Header.Get("Authorization")
+			if auth == "Bearer "+expected || r.URL.Query().Get("token") == expected {
+				next(w, r)
+				return
+			}
+			writeError(w, 401, "admin_auth_required", "admin token required for public access")
+			return
+		}
+		next(w, r)
+	}
 }
