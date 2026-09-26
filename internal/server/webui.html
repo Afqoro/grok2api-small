@@ -30,6 +30,18 @@ input{width:200px}textarea{width:100%;min-height:60px}
 </style>
 </head>
 <body>
+<div id="login-overlay" style="display:none;position:fixed;inset:0;background:#1a1a2e;z-index:9999;align-items:center;justify-content:center;">
+  <div style="background:#16213e;padding:2rem;border-radius:8px;width:300px;">
+    <h2 style="color:#e94560;margin:0 0 1rem;text-align:center;">grok2api-small</h2>
+    <form onsubmit="doLogin(event)">
+      <input id="login-user" placeholder="Username" style="width:100%;margin:0.3rem 0;padding:0.5rem;background:#0f3460;border:none;border-radius:4px;color:#fff;box-sizing:border-box;" />
+      <input id="login-pass" type="password" placeholder="Password" style="width:100%;margin:0.3rem 0;padding:0.5rem;background:#0f3460;border:none;border-radius:4px;color:#fff;box-sizing:border-box;" />
+      <button type="submit" style="width:100%;margin:0.5rem 0 0;padding:0.5rem;background:#e94560;border:none;border-radius:4px;color:#fff;cursor:pointer;">Login</button>
+    </form>
+    <p id="login-err" style="color:#e94560;text-align:center;margin:0.5rem 0 0;font-size:0.85rem;"></p>
+  </div>
+</div>
+<div id="dashboard">
 <h1>⚡ grok2api-small</h1>
 <div class="tabs">
 <div class="tab active" onclick="showTab('accounts')">Accounts</div>
@@ -103,25 +115,61 @@ input{width:200px}textarea{width:100%;min-height:60px}
         <table id="usage-table"><thead><tr><th>Account</th><th>Prompt</th><th>Completion</th><th>Requests</th></tr></thead><tbody></tbody></table>
       </div>
 <script>
-// --- admin token bootstrap (public tunnel access) ---
-(function () {
-  const m = location.hash.match(/token=([A-Za-z0-9_-]+)/);
-  if (m) {
-    localStorage.setItem('admin_token', m[1]);
-    history.replaceState(null, '', location.pathname); // strip token from URL
+// --- admin session auth ---
+let sessionToken = null;
+
+async function checkAuth() {
+  try {
+    const r = await fetch('/api/admin/authcheck', {credentials: 'same-origin'});
+    if (r.ok) { showDashboard(); return; }
+  } catch(e) {}
+  showLogin();
+}
+
+function showLogin() {
+  document.getElementById('login-overlay').style.display = 'flex';
+  document.getElementById('dashboard').style.display = 'none';
+}
+
+function showDashboard() {
+  document.getElementById('login-overlay').style.display = 'none';
+  document.getElementById('dashboard').style.display = '';
+  loadAccounts();
+}
+
+async function doLogin(e) {
+  e.preventDefault();
+  const u = document.getElementById('login-user').value;
+  const p = document.getElementById('login-pass').value;
+  const r = await fetch('/api/admin/login', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    credentials: 'same-origin',
+    body: JSON.stringify({username: u, password: p})
+  });
+  if (r.ok) {
+    const d = await r.json();
+    sessionToken = d.token;
+    showDashboard();
+  } else {
+    document.getElementById('login-err').textContent = 'Invalid username or password';
   }
-  const origFetch = window.fetch;
-  window.fetch = function (url, opts) {
-    if (typeof url === 'string' && url.startsWith('/api/admin/')) {
-      const t = localStorage.getItem('admin_token');
-      if (t) {
-        opts = opts || {};
-        opts.headers = Object.assign({}, opts.headers, {'Authorization': 'Bearer ' + t});
-      }
+}
+
+// Override fetch for admin calls
+const origFetch = window.fetch;
+window.fetch = function(url, opts) {
+  if (typeof url === 'string' && url.startsWith('/api/admin/') && !url.includes('/login')) {
+    opts = opts || {};
+    opts.credentials = 'same-origin';
+    if (sessionToken) {
+      opts.headers = Object.assign({}, opts.headers, {'Authorization': 'Bearer ' + sessionToken});
     }
-    return origFetch(url, opts);
-  };
-})();
+  }
+  return origFetch(url, opts);
+};
+
+checkAuth();
 
 const API='/api/admin';
 let adminToken='';
@@ -211,5 +259,6 @@ document.getElementById('sync-output').textContent=`Done: ${d.succeeded} succeed
 
 loadAccounts();
 </script>
+</div>
 </body>
 </html>

@@ -2,14 +2,19 @@ package server
 
 import (
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"github.com/google/uuid"
 	"fmt"
 	"io"
-	"net"
+	"crypto/sha256"
+	"crypto/subtle"
 	"net/http"
 	"os"
 	"context"
 	"strings"
+	"sync"
+	"time"
 
 	"grok2api-small/internal/db"
 	"grok2api-small/internal/upstream"
@@ -19,6 +24,9 @@ var cryptoRand = rand.Reader
 
 func (s *Server) AdminRoutes(mux *http.ServeMux) {
 	auth := func(h http.HandlerFunc) http.HandlerFunc { return s.adminAuthMiddleware(h) }
+	mux.HandleFunc("/api/admin/login", s.handleAdminLogin)
+	mux.HandleFunc("/api/admin/logout", s.handleAdminLogout)
+	mux.HandleFunc("/api/admin/authcheck", auth(s.handleAdminAuthCheck))
 	mux.HandleFunc("/api/admin/accounts", auth(s.handleAdminAccounts))
 	mux.HandleFunc("/api/admin/accounts/", auth(s.handleAdminAccountItem))
 	mux.HandleFunc("/api/admin/accounts/import", auth(s.handleAdminImport))
@@ -302,46 +310,115 @@ func (s *Server) handleAdminUsage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, rows)
 }
 
-// adminAuthMiddleware requires a bearer token for requests arriving through
-// the public tunnel (identified by CF-Connecting-IP / X-Forwarded-For headers
-// set by cloudflared). Direct local/Tailscale access is not restricted.
+type adminSession struct {
+	Token     string
+	ExpiresAt time.Time
+}
+
+var (
+	sessions   = make(map[string]adminSession)
+	sessionsMu  sync.Mutex
+)
+
+// loadAdminAuth reads credentials from data/admin_auth.json
+func loadAdminAuth() (username, passwordHash, sessionSecret string, err error) {
+	data, err := os.ReadFile("data/admin_auth.json")
+	if err != nil {
+		return "", "", "", err
+	}
+	var cfg struct {
+		Username     string `json:"username"`
+		PasswordHash string `json:"password_hash"`
+		SessionSecret string `json:"session_secret"`
+	}
+	json.Unmarshal(data, &cfg)
+	return cfg.Username, cfg.PasswordHash, cfg.SessionSecret, nil
+}
+
+// adminAuthMiddleware checks for valid session on all admin routes.
+// Login/logout endpoints are exempt.
 func (s *Server) adminAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("CF-Connecting-IP") != "" || r.Header.Get("X-Forwarded-For") != "" {
-			// spoof risk: these headers could be set by the client itself when
-			// hitting the local port directly; only trust them when the request
-			// came from a loopback source (cloudflared connects from 127.0.0.1)
-			isLoopback := false
-			host, _, err := net.SplitHostPort(r.RemoteAddr)
-			if err == nil && (host == "127.0.0.1" || host == "::1") {
-				isLoopback = true
-			}
-			if !isLoopback {
-				// direct remote client claiming CF headers = spoof attempt; require token
-				token, _ := os.ReadFile("data/admin_token.txt")
-				expected := strings.TrimSpace(string(token))
-				auth := r.Header.Get("Authorization")
-				if expected != "" && (auth == "Bearer "+expected || r.URL.Query().Get("token") == expected) {
-					next(w, r)
-					return
-				}
-				writeError(w, 401, "admin_auth_required", "admin token required")
-				return
-			}
-			token, _ := os.ReadFile("data/admin_token.txt")
-			expected := strings.TrimSpace(string(token))
-			if expected == "" {
-				writeError(w, 503, "admin_auth_unconfigured", "admin token not configured")
-				return
-			}
-			auth := r.Header.Get("Authorization")
-			if auth == "Bearer "+expected || r.URL.Query().Get("token") == expected {
+		cookie, err := r.Cookie("admin_session")
+		if err == nil && cookie.Value != "" {
+			sessionsMu.Lock()
+			sess, ok := sessions[cookie.Value]
+			sessionsMu.Unlock()
+			if ok && time.Now().Before(sess.ExpiresAt) {
 				next(w, r)
 				return
 			}
-			writeError(w, 401, "admin_auth_required", "admin token required for public access")
-			return
 		}
-		next(w, r)
+		// Also accept Bearer token (for API clients)
+		auth := r.Header.Get("Authorization")
+		if strings.HasPrefix(auth, "Bearer ") {
+			tok := strings.TrimPrefix(auth, "Bearer ")
+			sessionsMu.Lock()
+			sess, ok := sessions[tok]
+			sessionsMu.Unlock()
+			if ok && time.Now().Before(sess.ExpiresAt) {
+				next(w, r)
+				return
+			}
+		}
+		writeError(w, 401, "unauthorized", "Admin login required")
+		return
 	}
+}
+
+// handleAdminLogin validates username+password and issues session cookie
+func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeError(w, 405, "method_not_allowed", "POST only")
+		return
+	}
+	var body struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+
+	expectedUser, expectedHash, _, err := loadAdminAuth()
+	if err != nil {
+		writeError(w, 503, "admin_auth_unconfigured", "admin_auth.json not found")
+		return
+	}
+
+	// Constant-time comparison
+	hash := sha256.Sum256([]byte(body.Password))
+	userMatch := subtle.ConstantTimeCompare([]byte(body.Username), []byte(expectedUser)) == 1
+	passMatch := subtle.ConstantTimeCompare([]byte(hex.EncodeToString(hash[:])), []byte(expectedHash)) == 1
+
+	if !userMatch || !passMatch {
+		writeError(w, 401, "invalid_credentials", "Invalid username or password")
+		return
+	}
+
+	token := uuid.NewString()
+	sessionsMu.Lock()
+	sessions[token] = adminSession{Token: token, ExpiresAt: time.Now().Add(24 * time.Hour)}
+	sessionsMu.Unlock()
+
+	http.SetCookie(w, &http.Cookie{
+		Name: "admin_session", Value: token, Path: "/", HttpOnly: true,
+		MaxAge: 86400, SameSite: http.SameSiteLaxMode, Secure: r.TLS != nil || r.Header.Get("CF-Connecting-IP") != "",
+	})
+	writeJSON(w, 200, map[string]any{"status": "ok", "token": token})
+}
+
+// handleAdminLogout clears session
+func (s *Server) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
+	cookie, err := r.Cookie("admin_session")
+	if err == nil {
+		sessionsMu.Lock()
+		delete(sessions, cookie.Value)
+		sessionsMu.Unlock()
+	}
+	http.SetCookie(w, &http.Cookie{Name: "admin_session", Value: "", Path: "/", MaxAge: -1})
+	writeJSON(w, 200, map[string]any{"status": "ok"})
+}
+
+// handleAdminAuthCheck returns 200 if session valid, 401 otherwise
+func (s *Server) handleAdminAuthCheck(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]any{"status": "ok"})
 }
