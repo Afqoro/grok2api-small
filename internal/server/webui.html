@@ -103,6 +103,26 @@ input{width:200px}textarea{width:100%;min-height:60px}
         <table id="usage-table"><thead><tr><th>Account</th><th>Prompt</th><th>Completion</th><th>Requests</th></tr></thead><tbody></tbody></table>
       </div>
 <script>
+// --- admin token bootstrap (public tunnel access) ---
+(function () {
+  const m = location.hash.match(/token=([A-Za-z0-9_-]+)/);
+  if (m) {
+    localStorage.setItem('admin_token', m[1]);
+    history.replaceState(null, '', location.pathname); // strip token from URL
+  }
+  const origFetch = window.fetch;
+  window.fetch = function (url, opts) {
+    if (typeof url === 'string' && url.startsWith('/api/admin/')) {
+      const t = localStorage.getItem('admin_token');
+      if (t) {
+        opts = opts || {};
+        opts.headers = Object.assign({}, opts.headers, {'Authorization': 'Bearer ' + t});
+      }
+    }
+    return origFetch(url, opts);
+  };
+})();
+
 const API='/api/admin';
 let adminToken='';
 
