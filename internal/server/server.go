@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"context"
 	"time"
 
 	"grok2api-small/internal/converter"
@@ -56,10 +57,12 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		matched := false
+		var allowAliases bool
 		for _, k := range keys {
 			plain, err := s.cipher.Decrypt(k.EncryptedSecret)
 			if err == nil && plain == token {
 				matched = true
+				allowAliases = k.AllowModelAliases
 				break
 			}
 		}
@@ -67,7 +70,8 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			writeError(w, 401, "invalid_api_key", "Invalid API key")
 			return
 		}
-		next(w, r)
+		ctx := context.WithValue(r.Context(), "allowAliases", allowAliases)
+		next(w, r.WithContext(ctx))
 	}
 }
 
@@ -76,6 +80,10 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, 500, "model_list_failed", err.Error())
 		return
+	}
+	allowAliases := false
+	if v, ok := r.Context().Value("allowAliases").(bool); ok {
+		allowAliases = v
 	}
 	var data []map[string]any
 	seen := map[string]bool{}
@@ -87,6 +95,18 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		data = append(data, map[string]any{
 			"id": route.PublicID, "object": "model", "created": 0, "owned_by": "grok2api-small",
 		})
+		// Expand reasoning effort aliases
+		if allowAliases {
+			for _, effort := range []string{"low", "medium", "high", "xhigh"} {
+				alias := route.PublicID + "-" + effort
+				if !seen[alias] {
+					seen[alias] = true
+					data = append(data, map[string]any{
+						"id": alias, "object": "model", "created": 0, "owned_by": "grok2api-small",
+					})
+				}
+			}
+		}
 	}
 	if data == nil {
 		data = []map[string]any{}
