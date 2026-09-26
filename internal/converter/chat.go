@@ -122,7 +122,7 @@ func convertMessages(messages []chatMessage, scope string) ([]any, error) {
 			content := extractText(msg.Content)
 			if content != "" {
 				out = append(out, map[string]any{
-					"type": "system", "content": content,
+					"type": "message", "role": "system", "content": content,
 				})
 			}
 		case "user":
@@ -131,11 +131,11 @@ func convertMessages(messages []chatMessage, scope string) ([]any, error) {
 				return nil, err
 			}
 			out = append(out, map[string]any{
-				"role": "user", "content": content,
+				"type": "message", "role": "user", "content": content,
 			})
 		case "assistant":
 			content := extractText(msg.Content)
-			item := map[string]any{"role": "assistant"}
+			item := map[string]any{"type": "message", "role": "assistant"}
 			if content != "" {
 				item["content"] = content
 			}
