@@ -91,15 +91,15 @@ func (c *StreamConverter) textDelta(delta string) error {
 	})
 }
 
-func (c *StreamConverter) toolStart(id, name, arguments string) error {
+func (c *StreamConverter) toolStart(itemKey, callID, name, arguments string) error {
 	if err := c.start(); err != nil {
 		return err
 	}
-	if _, exists := c.tools[id]; exists {
+	if _, exists := c.tools[itemKey]; exists {
 		return nil
 	}
-	tool := streamTool{Index: len(c.tools), ID: id, Name: name, Arguments: arguments}
-	c.tools[id] = tool
+	tool := streamTool{Index: len(c.tools), ID: callID, Name: name, Arguments: arguments}
+	c.tools[itemKey] = tool
 	return c.writeSSE(map[string]any{
 		"id": c.id, "object": "chat.completion.chunk", "created": c.created, "model": c.model,
 		"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{map[string]any{
@@ -201,10 +201,11 @@ func (c *StreamConverter) handleEvent(event map[string]any, status *string, usag
 			if item != nil {
 				itemType, _ := item["type"].(string)
 				if itemType == "function_call" {
-					id, _ := item["call_id"].(string)
+					itemID, _ := item["id"].(string)
+					callID, _ := item["call_id"].(string)
 					name, _ := item["name"].(string)
 					args, _ := item["arguments"].(string)
-					c.toolStart(id, name, args)
+					c.toolStart(itemID, callID, name, args)
 				}
 			}
 		case "response.function_call_arguments.delta":

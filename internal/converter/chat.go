@@ -134,14 +134,12 @@ func convertMessages(messages []chatMessage, scope string) ([]any, error) {
 				"type": "message", "role": "user", "content": content,
 			})
 		case "assistant":
-			content := extractText(msg.Content)
-			item := map[string]any{"type": "message", "role": "assistant"}
-			if content != "" {
-				item["content"] = content
-			}
-			if len(item) > 1 {
-				out = append(out, item)
-			}
+		content := extractText(msg.Content)
+		if content != "" {
+			out = append(out, map[string]any{
+				"type": "message", "role": "assistant", "content": content,
+			})
+		}
 			if !isEmptyJSON(msg.ToolCalls) {
 				var calls []map[string]any
 				if json.Unmarshal(msg.ToolCalls, &calls) == nil {
